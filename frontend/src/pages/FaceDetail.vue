@@ -4,11 +4,19 @@ import { useRoute, useRouter } from 'vue-router';
 import { useFaceStore } from '../stores/faceStore';
 import { useGradeStore } from '../stores/gradeStore';
 import { useJointStore } from '../stores/jointStore';
+import { useFaceLock } from '../hooks/useFaceLock';
 import { useGradeCalc } from '../hooks/useGradeCalc';
 import SketchCanvas from '../components/common/SketchCanvas.vue';
 import GradeTag from '../components/common/GradeTag.vue';
+import LockBanner from '../components/common/LockBanner.vue';
 import { attitudeText, formatChainage } from '../utils/geoMath';
-import { GRADE_SUPPORT } from '../types/grade';
+import {
+  GRADE_STATUS_TEXT,
+  GRADE_SUPPORT,
+  INVALID_REASON_TEXT,
+  type InvalidationReason,
+} from '../types/grade';
+import { RELAY_SCOPE_TEXT } from '../types/relay';
 
 const route = useRoute();
 const router = useRouter();
@@ -20,15 +28,30 @@ const faceId = computed(() => String(route.params.id ?? ''));
 const face = computed(() => faceStore.byId(faceId.value));
 const joints = computed(() => jointStore.byFace(faceId.value));
 const grades = computed(() => gradeStore.byFace(faceId.value));
-const latest = computed(() => grades.value[0]);
+const latest = computed(() => gradeStore.latestByFace(faceId.value));
 const previousGrade = computed(() => grades.value[1]);
+/** 最近一条失效记录（用于提示"旧结论已失效，正在重算/待复核"） */
+const staleRecord = computed(() => grades.value.find((row) => row.status === 'stale'));
+
+const sketchLock = useFaceLock({ faceId, scope: 'sketch' });
 
 const { result, patch } = useGradeCalc(() => joints.value);
 const segmentCount = ref(0);
 
+/** 本掌子面是否正被某个页面编录（任何范围） */
+const otherLease = computed(() => {
+  const lease = sketchLock.relay.leaseOf(faceId.value);
+  if (!lease) return undefined;
+  return sketchLock.relay.isHolder(faceId.value) ? undefined : lease;
+});
+
 /** SketchCanvas 变更回调（用命名函数避免模板内联箭头参数丢类型） */
 function onSketchChange(segs: { id: string }[]): void {
   segmentCount.value = segs.length;
+}
+
+function reasonText(reasons?: InvalidationReason[]): string {
+  return (reasons ?? []).map((r) => INVALID_REASON_TEXT[r]).join('、');
 }
 
 /** 与上循环级别比对结论 */
@@ -59,7 +82,11 @@ onMounted(async () => {
       <h2>掌子面详情 · {{ face?.faceNo ?? '未找到' }}</h2>
       <GradeTag v-if="latest" :grade="latest.grade" />
       <el-tag v-else type="info">未判定级别</el-tag>
+      <el-tag v-if="latest?.status === 'pending'" type="warning">待复核</el-tag>
       <el-tag type="info" effect="plain">节理 {{ joints.length }} 组</el-tag>
+      <el-tag v-if="otherLease" type="danger" effect="dark" size="small">
+        {{ otherLease.tabName }} 正在{{ RELAY_SCOPE_TEXT[otherLease.scope] }}编录
+      </el-tag>
       <div class="spacer" />
       <el-button type="primary" @click="router.push(`/faces/${faceId}/joints`)">节理录入</el-button>
       <el-button @click="router.push(`/faces/${faceId}/water`)">涌水记录</el-button>
@@ -68,6 +95,29 @@ onMounted(async () => {
     </div>
 
     <el-alert v-if="!face" type="warning" :closable="false" show-icon title="未找到该掌子面（可能已被删除）" />
+
+    <template v-if="face">
+      <!-- 依据变化后旧围岩级别不再当现行结论 -->
+      <el-alert
+        v-if="staleRecord"
+        type="warning"
+        show-icon
+        :closable="false"
+        :title="`${reasonText(staleRecord.invalidatedReasons)}，原 ${staleRecord.grade} 级判定已失效；${latest ? `最新结论 ${latest.grade} 级${latest.status === 'pending' ? '（待复核）' : ''}` : '等待重新判定'}`"
+      />
+
+      <LockBanner
+        :state="sketchLock.state.value"
+        scope="sketch"
+        :lease="sketchLock.lease.value"
+        :wait-position="sketchLock.waitPosition.value"
+        :waits="sketchLock.waits.value"
+        :tab-name="sketchLock.relay.tabName"
+        @request="sketchLock.request"
+        @release="sketchLock.release"
+        @rename="(name: string) => sketchLock.relay.setTabName(name)"
+      />
+    </template>
 
     <div v-if="face" class="grid">
       <div class="left">
@@ -96,8 +146,17 @@ onMounted(async () => {
         <el-card shadow="never">
           <template #header><strong>级别与支护</strong></template>
           <div v-if="latest" class="grade-box">
-            <GradeTag :grade="latest.grade" />
+            <div class="grade-line">
+              <GradeTag :grade="latest.grade" />
+              <el-tag size="small" :type="latest.status === 'pending' ? 'warning' : 'success'">
+                {{ GRADE_STATUS_TEXT[latest.status ?? 'active'] }}
+              </el-tag>
+              <el-tag v-if="latest.autoRecomputed" size="small" type="warning" effect="plain">自动重算</el-tag>
+            </div>
             <span class="muted">[BQ] = {{ latest.correctedBq }}（BQ {{ latest.bqValue }}，修正 {{ latest.correction }}）</span>
+            <p v-if="latest.status === 'pending' && latest.autoGrade" class="muted">
+              人工修正保留：系统自动建议 {{ latest.autoGrade }} 级（[BQ] {{ latest.autoCorrectedBq }}），请到判定页复核。
+            </p>
             <p class="support">{{ latest.supportSuggestion || GRADE_SUPPORT[latest.grade] }}</p>
             <p class="muted">{{ gradeCompare }}</p>
           </div>
@@ -139,6 +198,7 @@ onMounted(async () => {
           :face-id="face.id"
           :lithology="face.lithology"
           :attitude="face.attitude"
+          :readonly="!sketchLock.isHolder.value"
           @change="onSketchChange"
         />
       </el-card>
@@ -194,5 +254,10 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+.grade-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

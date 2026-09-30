@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus';
 import { useFaceStore } from '../stores/faceStore';
 import { useGradeStore } from '../stores/gradeStore';
 import { useJointStore } from '../stores/jointStore';
+import { useRelayStore } from '../stores/relayStore';
 import { useFaceFilter } from '../hooks/useFaceFilter';
 import FaceCard from '../components/common/FaceCard.vue';
 import GradeTag from '../components/common/GradeTag.vue';
@@ -23,7 +24,15 @@ const router = useRouter();
 const faceStore = useFaceStore();
 const gradeStore = useGradeStore();
 const jointStore = useJointStore();
+const relayStore = useRelayStore();
+relayStore.start();
 const { filters, result, options, gradeDistribution, reset } = useFaceFilter();
+
+/** 该掌子面是否存在"已失效但无新现行结论"的记录 */
+function gradeStale(faceId: string): boolean {
+  if (gradeStore.latestByFace(faceId)) return false;
+  return gradeStore.items.some((it) => it.faceId === faceId && it.status === 'stale');
+}
 
 const dialogVisible = ref(false);
 const error = ref('');
@@ -167,8 +176,11 @@ onMounted(async () => {
         :key="row.face.id"
         :face="row.face"
         :grade="row.grade"
+        :review-required="gradeStore.latestByFace(row.face.id)?.reviewRequired ?? false"
+        :grade-stale="gradeStale(row.face.id)"
         :joint-count="jointStore.byFace(row.face.id).length"
         :water-count="gradeStore.watersByFace(row.face.id).length"
+        :holder="relayStore.holderByFace[row.face.id]"
         :footer="`编录时间 ${new Date(row.lastRecordedAt).toLocaleString('zh-CN')}`"
         @open="(id) => router.push(`/faces/${id}`)"
       />

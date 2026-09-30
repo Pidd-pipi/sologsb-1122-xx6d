@@ -8,6 +8,25 @@ export type Groundwater = '干燥' | '潮湿' | '点滴状出水' | '线状出�
 
 export const GROUNDWATERS: Groundwater[] = ['干燥', '潮湿', '点滴状出水', '线状出水', '涌流状出水'];
 
+/** 判定记录接力状态：现行 / 待复核 / 已失效（依据变化）/ 已被新判定取代 */
+export type GradeStatus = 'active' | 'pending' | 'stale' | 'superseded';
+
+/** 失效触发原因 */
+export type InvalidationReason = 'joint' | 'water' | 'attitude';
+
+export const GRADE_STATUS_TEXT: Record<GradeStatus, string> = {
+  active: '现行',
+  pending: '待复核',
+  stale: '已失效',
+  superseded: '已取代',
+};
+
+export const INVALID_REASON_TEXT: Record<InvalidationReason, string> = {
+  joint: '节理产状变化',
+  water: '涌水情况变化',
+  attitude: '岩层产状变化',
+};
+
 /** 围岩级别判定记录 */
 export interface RockMassGrade {
   id: string;
@@ -33,9 +52,47 @@ export interface RockMassGrade {
   /** 是否人工修正级别 */
   manualAdjusted: boolean;
   judgedAt: number;
+  /** 接力状态（v3，老数据视为 active） */
+  status?: GradeStatus;
+  /** 判定依据签名：节理/涌水/产状快照哈希，依据变化即失效 */
+  basisSignature?: string;
+  /** 判定依据摘要文本，便于追溯 */
+  basisText?: string;
+  /** 失效原因（stale 时记录） */
+  invalidatedReasons?: InvalidationReason[];
+  /** 失效时间 */
+  invalidatedAt?: number;
+  /** 待复核：人工修正保留或复核流程未完成 */
+  reviewRequired?: boolean;
+  /** 是否依据变化后系统自动重算的记录 */
+  autoRecomputed?: boolean;
+  /** 人工修正保留时，系统自动算得的建议级别 */
+  autoGrade?: RockGrade;
+  /** 自动算得的 [BQ] */
+  autoCorrectedBq?: number;
+  /** 复核通过时间 */
+  reviewedAt?: number;
 }
 
 export type RockMassGradeDraft = Omit<RockMassGrade, 'id' | 'judgedAt'>;
+
+/** 补齐老记录缺失的接力字段 */
+export function normalizeGrade(row: RockMassGrade): RockMassGrade {
+  return {
+    ...row,
+    status: row.status ?? 'active',
+    invalidatedReasons: row.invalidatedReasons ?? [],
+    reviewRequired: row.reviewRequired ?? false,
+    autoRecomputed: row.autoRecomputed ?? false,
+    manualAdjusted: row.manualAdjusted ?? false,
+  };
+}
+
+/** 是否仍是现行结论（待复核记录也占现行位，等待人工处置） */
+export function isCurrentGrade(row: RockMassGrade): boolean {
+  const status = row.status ?? 'active';
+  return status === 'active' || status === 'pending';
+}
 
 /** 级别色带（用于 <GradeTag>） */
 export const GRADE_COLOR: Record<RockGrade, string> = {

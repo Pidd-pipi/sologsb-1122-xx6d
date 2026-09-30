@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { Attitude } from '../../types/face';
 
 export interface SketchSegment {
@@ -65,6 +65,11 @@ function load() {
   }
 }
 
+/** 其他标签页（接力持有者）改动素描后实时同步，等待页离线也能看到最新 */
+function onStorage(event: StorageEvent) {
+  if (event.key === storageKey.value) load();
+}
+
 function persist() {
   try {
     window.localStorage.setItem(storageKey.value, JSON.stringify(segments.value));
@@ -124,9 +129,14 @@ function tickOf(seg: SketchSegment) {
   return { x: seg.x + nx * 10, y: seg.y + ny * 10 };
 }
 
-onMounted(load);
+onMounted(() => {
+  load();
+  window.addEventListener('storage', onStorage);
+});
 watch(() => props.faceId, load);
-watch(storageKey, persist);
+onBeforeUnmount(() => {
+  window.removeEventListener('storage', onStorage);
+});
 </script>
 
 <template>

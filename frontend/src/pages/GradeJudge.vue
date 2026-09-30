@@ -3,11 +3,22 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { useFaceStore } from '../stores/faceStore';
-import { useGradeStore } from '../stores/gradeStore';
+import { useGradeStore, signatureOf } from '../stores/gradeStore';
 import { useJointStore } from '../stores/jointStore';
 import { useGradeCalc } from '../hooks/useGradeCalc';
+import { useFaceLock } from '../hooks/useFaceLock';
 import GradeTag from '../components/common/GradeTag.vue';
-import { GROUNDWATERS, GRADE_SUPPORT, ROCK_GRADES, type Groundwater, type RockGrade } from '../types/grade';
+import LockBanner from '../components/common/LockBanner.vue';
+import {
+  GROUNDWATERS,
+  GRADE_STATUS_TEXT,
+  GRADE_SUPPORT,
+  INVALID_REASON_TEXT,
+  ROCK_GRADES,
+  type Groundwater,
+  type InvalidationReason,
+  type RockGrade,
+} from '../types/grade';
 import { attitudeText, estimateJv, formatChainage } from '../utils/geoMath';
 
 const route = useRoute();
@@ -19,24 +30,39 @@ const jointStore = useJointStore();
 const faceId = computed(() => String(route.params.faceId ?? ''));
 const face = computed(() => faceStore.byId(faceId.value));
 const joints = computed(() => jointStore.byFace(faceId.value));
+const waters = computed(() => gradeStore.watersByFace(faceId.value));
 const history = computed(() => gradeStore.byFace(faceId.value));
-const previous = computed(() => history.value[0]);
+const latest = computed(() => gradeStore.latestByFace(faceId.value));
 
 const { input, result, patch } = useGradeCalc(() => joints.value);
 const manual = ref(false);
 const manualGrade = ref<RockGrade>('Ⅲ');
 
+const lock = useFaceLock({
+  faceId,
+  scope: 'grade',
+  draftSource: () => ({ input: { ...input.value }, manual: manual.value, manualGrade: manualGrade.value }),
+});
+
+function rename(name: string) {
+  lock.relay.setTabName(name);
+}
+
 const finalGrade = computed<RockGrade>(() => (manual.value ? manualGrade.value : result.value.grade));
 const finalSupport = computed(() => GRADE_SUPPORT[finalGrade.value]);
 
+const pendingRecord = computed(() =>
+  latest.value?.status === 'pending' && latest.value.reviewRequired ? latest.value : undefined,
+);
+
 const compareText = computed(() => {
-  if (!previous.value) return '本掌子面尚无历史判定，保存后将成为首次记录';
+  if (!latest.value) return '本掌子面尚无历史判定，保存后将成为首次记录';
   const order = ROCK_GRADES;
-  const delta = order.indexOf(finalGrade.value) - order.indexOf(previous.value.grade);
-  if (delta === 0) return `与上循环级别一致（${previous.value.grade} 级）`;
+  const delta = order.indexOf(finalGrade.value) - order.indexOf(latest.value.grade);
+  if (delta === 0) return `与上循环级别一致（${latest.value.grade} 级）`;
   return delta > 0
-    ? `较上循环变差 ${delta} 级：${previous.value.grade} → ${finalGrade.value}`
-    : `较上循环变好 ${-delta} 级：${previous.value.grade} → ${finalGrade.value}`;
+    ? `较上循环变差 ${delta} 级：${latest.value.grade} → ${finalGrade.value}`
+    : `较上循环变好 ${-delta} 级：${latest.value.grade} → ${finalGrade.value}`;
 });
 
 watch(
@@ -47,12 +73,33 @@ watch(
   { immediate: true },
 );
 
+/** 进入页面时若存在判定输入草稿，提示可接续 */
+function restoreDraft() {
+  const payload = lock.draft.value?.payload as
+    | { input?: typeof input.value; manual?: boolean; manualGrade?: RockGrade }
+    | undefined;
+  if (!payload) {
+    lock.markDraftRestored();
+    return;
+  }
+  if (payload.input) patch(payload.input);
+  if (typeof payload.manual === 'boolean') manual.value = payload.manual;
+  if (payload.manualGrade) manualGrade.value = payload.manualGrade;
+  ElMessage.success('已接续上次未保存的判定输入');
+  lock.markDraftRestored();
+}
+
 async function save() {
+  if (!lock.isHolder.value) {
+    ElMessage.warning('请先申请并取得本掌子面的编辑权');
+    return;
+  }
   if (!face.value) {
     ElMessage.error('未找到该掌子面');
     return;
   }
-  await gradeStore.addGrade({
+  const { signature, text } = signatureOf(face.value, joints.value, waters.value);
+  await gradeStore.saveGrade({
     faceId: face.value.id,
     grade: finalGrade.value,
     bqValue: result.value.bq,
@@ -65,8 +112,47 @@ async function save() {
     correctedBq: result.value.correctedBq,
     supportSuggestion: finalSupport.value,
     manualAdjusted: manual.value,
+    status: 'active',
+    reviewRequired: false,
+    basisSignature: signature,
+    basisText: text,
   });
+  await lock.clearDraft();
   ElMessage.success(`已保存 ${finalGrade.value} 级围岩判定`);
+}
+
+/** 复核：确认保留的人工级别为现行结论 */
+async function confirmKept() {
+  if (!pendingRecord.value || !lock.isHolder.value) {
+    ElMessage.warning('复核操作需要编辑权');
+    return;
+  }
+  await gradeStore.confirmReview(pendingRecord.value.id);
+  ElMessage.success('已复核确认，该级别成为现行结论');
+}
+
+/** 复核：采用系统自动算得的级别 */
+async function adoptAuto() {
+  if (!pendingRecord.value || !lock.isHolder.value) return;
+  await gradeStore.adoptAuto(pendingRecord.value.id);
+  ElMessage.success('已采用系统自动重算级别');
+}
+
+/** 复核：人工改判 */
+async function reviewAdjust(grade: RockGrade) {
+  if (!pendingRecord.value || !lock.isHolder.value) return;
+  await gradeStore.reviewAdjust(pendingRecord.value.id, grade, GRADE_SUPPORT[grade]);
+  ElMessage.success(`已复核改判为 ${grade} 级`);
+}
+
+function reasonText(reasons?: InvalidationReason[]): string {
+  return (reasons ?? []).map((r) => INVALID_REASON_TEXT[r]).join('、');
+}
+
+/** 失效/被取代历史行灰显划线 */
+function historyRowClass({ row }: { row: { status?: string } }): string {
+  if (row.status === 'stale' || row.status === 'superseded') return 'grade-row-stale';
+  return '';
 }
 
 onMounted(async () => {
@@ -79,6 +165,8 @@ onMounted(async () => {
       spanWidth: Number(face.value.faceSize.split('×')[0]) || 12,
     });
   }
+  // 进入即申请编录权；他人占用时自动排队，等待期间离线只读查看
+  await lock.request();
 });
 </script>
 
@@ -93,11 +181,54 @@ onMounted(async () => {
       <el-button @click="router.push(`/faces/${faceId}/joints`)">节理录入</el-button>
     </div>
 
+    <LockBanner
+      :state="lock.state.value"
+      scope="grade"
+      :lease="lock.lease.value"
+      :wait-position="lock.waitPosition.value"
+      :waits="lock.waits.value"
+      :tab-name="lock.relay.tabName"
+      :has-draft="!!lock.draft.value && !lock.draftRestored.value"
+      :draft-owner="lock.draft.value?.ownerName"
+      @request="lock.request"
+      @release="lock.release"
+      @rename="rename"
+      @restore-draft="restoreDraft"
+      @discard-draft="lock.discardDraft"
+    />
+
+    <!-- 依据变化后：人工修正保留，挂待复核 -->
+    <el-alert
+      v-if="pendingRecord"
+      type="warning"
+      show-icon
+      :closable="false"
+      :title="`因${reasonText(pendingRecord.invalidatedReasons)}，原人工修正 ${pendingRecord.grade} 级已保留但标记待复核；系统自动重算建议为 ${pendingRecord.autoGrade} 级（[BQ] ${pendingRecord.autoCorrectedBq}）`"
+    >
+      <div class="review-actions">
+        <el-button size="small" type="primary" :disabled="!lock.isHolder.value" @click="confirmKept">
+          复核确认保留 {{ pendingRecord.grade }} 级
+        </el-button>
+        <el-button size="small" :disabled="!lock.isHolder.value" @click="adoptAuto">
+          采用自动 {{ pendingRecord.autoGrade }} 级
+        </el-button>
+        <el-radio-group
+          size="small"
+          :disabled="!lock.isHolder.value"
+          @change="(g: RockGrade) => reviewAdjust(g)"
+        >
+          <el-radio-button v-for="g in ROCK_GRADES" :key="g" :value="g">{{ g }}</el-radio-button>
+        </el-radio-group>
+        <span class="muted">复核改判</span>
+      </div>
+    </el-alert>
+
     <el-alert v-if="!face" type="warning" :closable="false" show-icon title="未找到该掌子面" />
 
     <div class="grid">
       <el-card shadow="never">
         <template #header><strong>逐项指标输入</strong></template>
+        <fieldset :disabled="!lock.isHolder.value" class="lock-fieldset">
         <el-form label-width="150px">
           <el-form-item label="饱和抗压强度 Rc">
             <el-input-number v-model="input.rockStrength" :min="1" :max="300" :step="1" />
@@ -128,6 +259,7 @@ onMounted(async () => {
             <el-input-number v-model="input.extraCorrection" :min="0" :max="1" :step="0.01" :precision="2" />
           </el-form-item>
         </el-form>
+        </fieldset>
       </el-card>
 
       <div class="right">
@@ -137,15 +269,20 @@ onMounted(async () => {
             <GradeTag :grade="finalGrade" />
             <span class="muted">BQ = {{ result.bq }} · [BQ] = {{ result.correctedBq }}</span>
             <el-tag v-if="manual" type="warning" size="small">人工修正</el-tag>
+            <el-tag v-if="latest?.status === 'pending'" type="warning" size="small">现行结论待复核</el-tag>
+            <el-tag v-else-if="latest" type="success" size="small">现行 {{ latest.grade }} 级</el-tag>
           </div>
           <p class="support">{{ finalSupport }}</p>
-          <el-checkbox v-model="manual">启用人工修正级别</el-checkbox>
-          <el-radio-group v-if="manual" v-model="manualGrade" style="margin-top: 8px">
-            <el-radio-button v-for="g in ROCK_GRADES" :key="g" :value="g">{{ g }}</el-radio-button>
-          </el-radio-group>
+          <fieldset :disabled="!lock.isHolder.value" class="lock-fieldset">
+            <el-checkbox v-model="manual">启用人工修正级别</el-checkbox>
+            <el-radio-group v-if="manual" v-model="manualGrade" style="margin-top: 8px">
+              <el-radio-button v-for="g in ROCK_GRADES" :key="g" :value="g">{{ g }}</el-radio-button>
+            </el-radio-group>
+          </fieldset>
           <el-divider />
           <p class="muted">{{ compareText }}</p>
-          <el-button type="primary" @click="save">保存判定结果</el-button>
+          <el-button type="primary" :disabled="!lock.isHolder.value" @click="save">保存判定结果</el-button>
+          <span v-if="!lock.isHolder.value" class="hint">取得编辑权后可保存</span>
         </el-card>
 
         <el-card shadow="never">
@@ -157,7 +294,7 @@ onMounted(async () => {
 
         <el-card shadow="never">
           <template #header><strong>本掌子面历史判定</strong></template>
-          <el-table :data="history" size="small" border>
+          <el-table :data="history" size="small" border :row-class-name="historyRowClass">
             <el-table-column label="时间" width="170">
               <template #default="{ row }">{{ new Date(row.judgedAt).toLocaleString('zh-CN') }}</template>
             </el-table-column>
@@ -171,6 +308,20 @@ onMounted(async () => {
             <el-table-column prop="groundwater" label="出水" width="120" />
             <el-table-column label="修正" width="80">
               <template #default="{ row }">{{ row.manualAdjusted ? '人工' : '自动' }}</template>
+            </el-table-column>
+            <el-table-column label="接力状态" width="170">
+              <template #default="{ row }">
+                <el-tag
+                  size="small"
+                  :type="row.status === 'active' ? 'success' : row.status === 'pending' ? 'warning' : 'info'"
+                >
+                  {{ GRADE_STATUS_TEXT[(row.status ?? 'active') as keyof typeof GRADE_STATUS_TEXT] }}
+                </el-tag>
+                <el-tag v-if="row.autoRecomputed" size="small" type="warning" effect="plain">自动重算</el-tag>
+                <div v-if="row.status === 'stale'" class="stale-reason">
+                  {{ reasonText(row.invalidatedReasons) }}
+                </div>
+              </template>
             </el-table-column>
           </el-table>
           <el-empty v-if="history.length === 0" description="尚无历史判定" :image-size="60" />
@@ -249,5 +400,29 @@ onMounted(async () => {
   color: #5b6470;
   font-size: 13px;
   line-height: 1.9;
+}
+.lock-fieldset {
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+.review-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+.stale-reason {
+  font-size: 11px;
+  color: #b06a1e;
+  margin-top: 2px;
+}
+:deep(.grade-row-stale) {
+  color: #a7afba;
+}
+:deep(.grade-row-stale .grade-tag) {
+  opacity: 0.55;
+  text-decoration: line-through;
 }
 </style>

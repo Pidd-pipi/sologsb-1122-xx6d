@@ -1,14 +1,22 @@
 <script setup lang="ts">
 import type { TunnelFace } from '../../types/face';
 import type { RockGrade } from '../../types/grade';
+import type { RelayLease } from '../../types/relay';
+import { RELAY_SCOPE_TEXT } from '../../types/relay';
 import GradeTag from './GradeTag.vue';
 import { formatChainage } from '../../utils/geoMath';
 
 defineProps<{
   face: TunnelFace;
   grade?: RockGrade;
+  /** 现行结论待复核 */
+  reviewRequired?: boolean;
+  /** 旧判定已失效且尚无新结论 */
+  gradeStale?: boolean;
   jointCount?: number;
   waterCount?: number;
+  /** 当前占用本掌子面的接力租约 */
+  holder?: RelayLease;
   footer?: string;
 }>();
 
@@ -21,8 +29,16 @@ const emit = defineEmits<{
   <el-card class="face-card" shadow="hover" @click="emit('open', face.id)">
     <div class="row">
       <strong>{{ face.faceNo }}</strong>
-      <GradeTag :grade="grade" />
+      <GradeTag v-if="grade" :grade="grade" />
+      <el-tag v-else-if="gradeStale" type="warning" size="small">判定已失效</el-tag>
+      <GradeTag v-else label="未判定" />
+      <el-tag v-if="reviewRequired" type="warning" size="small">待复核</el-tag>
       <el-tag size="small" effect="plain">{{ face.excavationMethod }}</el-tag>
+    </div>
+    <div v-if="holder" class="row">
+      <el-tag type="danger" size="small">
+        {{ holder.tabName }} 正在{{ RELAY_SCOPE_TEXT[holder.scope] }}编录
+      </el-tag>
     </div>
     <div class="line">
       桩号 {{ formatChainage(face.chainage) }} · 编录区间

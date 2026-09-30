@@ -1,7 +1,14 @@
 import { defineStore } from 'pinia';
 import { db, toPlain } from '../utils/db';
 import { newId } from '../utils/id';
-import type { TunnelFace, TunnelFaceDraft } from '../types/face';
+import type { Attitude, TunnelFace, TunnelFaceDraft } from '../types/face';
+import { emitDataChange } from '../utils/relayBus';
+
+/** 延迟拿 gradeStore，避免模块循环初始化耦合 */
+async function invalidateGrade(faceId: string): Promise<void> {
+  const { useGradeStore } = await import('./gradeStore');
+  useGradeStore().invalidateForFace(faceId, 'attitude');
+}
 
 interface FaceState {
   items: TunnelFace[];
@@ -26,16 +33,27 @@ export const useFaceStore = defineStore('face', {
       const record: TunnelFace = { ...toPlain(draft), id: newId('face'), recordedAt: Date.now() };
       await db.faces.put(toPlain(record));
       this.items = [...this.items, record].sort((a, b) => b.chainage - a.chainage);
+      emitDataChange('faces', record.id);
       return record;
     },
     async update(id: string, patch: Partial<TunnelFace>) {
       const plain = toPlain(patch);
       await db.faces.update(id, plain);
       this.items = this.items.map((it) => (it.id === id ? { ...it, ...plain } : it));
+      emitDataChange('faces', id);
+      // 岩层产状变化 → 现行判定立即失效重算
+      if (plain.attitude) {
+        void invalidateGrade(id);
+      }
+    },
+    /** 单独更新岩层产状（素描/基本信息编录用） */
+    async updateAttitude(id: string, attitude: Attitude) {
+      await this.update(id, { attitude: toPlain(attitude) });
     },
     async remove(id: string) {
       await db.faces.delete(id);
       this.items = this.items.filter((it) => it.id !== id);
+      emitDataChange('faces', id);
     },
     /** 复制上一循环（里程更小的最近一个掌子面）的信息作为草稿 */
     previousDraft(id: string): TunnelFaceDraft | undefined {

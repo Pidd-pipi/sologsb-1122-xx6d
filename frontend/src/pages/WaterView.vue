@@ -4,6 +4,8 @@ import { useRoute, useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { useFaceStore } from '../stores/faceStore';
 import { useGradeStore } from '../stores/gradeStore';
+import { useFaceLock } from '../hooks/useFaceLock';
+import LockBanner from '../components/common/LockBanner.vue';
 import { CHANGE_TRENDS, INFLOW_TYPES, isSurge, type ChangeTrend, type InflowType, type WaterInflow, type WaterInflowDraft } from '../types/water';
 import { waterMeasure } from '../types/grade';
 import { formatChainage, parseChainage } from '../utils/geoMath';
@@ -29,6 +31,35 @@ const form = reactive<WaterInflowDraft>({
   changeTrend: '稳定',
   chainage: 0,
 });
+
+const lock = useFaceLock({
+  faceId,
+  scope: 'water',
+  draftSource: () => ({ ...form }),
+});
+
+function rename(name: string) {
+  lock.relay.setTabName(name);
+}
+
+/** 接续旧草稿回填 */
+function restoreDraft() {
+  const payload = lock.draft.value?.payload as Partial<WaterInflowDraft> | undefined;
+  if (payload) {
+    Object.assign(form, {
+      faceId: faceId.value,
+      position: payload.position ?? form.position,
+      type: payload.type ?? form.type,
+      estimatedFlow: payload.estimatedFlow ?? form.estimatedFlow,
+      waterTemp: payload.waterTemp ?? form.waterTemp,
+      waterPressure: payload.waterPressure ?? form.waterPressure,
+      changeTrend: payload.changeTrend ?? form.changeTrend,
+      chainage: payload.chainage ?? form.chainage,
+    });
+    ElMessage.success('已接续上次未保存的涌水草稿');
+  }
+  lock.markDraftRestored();
+}
 
 const W = 620;
 const H = 220;
@@ -76,6 +107,10 @@ const surges = computed(() => rows.value.filter((p) => isSurge(p, rows.value)));
 const totalFlow = computed(() => rows.value.reduce((s, p) => s + p.estimatedFlow, 0));
 
 async function submit() {
+  if (!lock.isHolder.value) {
+    ElMessage.warning('请先申请并取得本掌子面的编辑权');
+    return;
+  }
   error.value = '';
   if (!form.faceId) {
     error.value = '未指定掌子面';
@@ -90,8 +125,17 @@ async function submit() {
     return;
   }
   const created = await gradeStore.addWater({ ...form, position: form.position.trim() });
+  await lock.clearDraft();
   ElMessage.success(`已记录 ${created.position}：${created.type} ${created.estimatedFlow} L/min`);
   form.position = '';
+}
+
+async function removeRow(id: string) {
+  if (!lock.isHolder.value) {
+    ElMessage.warning('删除操作需要编辑权');
+    return;
+  }
+  await gradeStore.removeWater(id);
 }
 
 onMounted(async () => {
@@ -101,6 +145,8 @@ onMounted(async () => {
     form.faceId = face.value.id;
     form.chainage = face.value.chainage;
   }
+  // 进入即申请编录权；他人占用时自动排队，等待期间离线只读查看
+  await lock.request();
 });
 </script>
 
@@ -115,10 +161,27 @@ onMounted(async () => {
       <el-button @click="router.push(`/faces/${faceId}/joints`)">节理录入</el-button>
     </div>
 
+    <LockBanner
+      :state="lock.state.value"
+      scope="water"
+      :lease="lock.lease.value"
+      :wait-position="lock.waitPosition.value"
+      :waits="lock.waits.value"
+      :tab-name="lock.relay.tabName"
+      :has-draft="!!lock.draft.value && !lock.draftRestored.value"
+      :draft-owner="lock.draft.value?.ownerName"
+      @request="lock.request"
+      @release="lock.release"
+      @rename="rename"
+      @restore-draft="restoreDraft"
+      @discard-draft="lock.discardDraft"
+    />
+
     <div class="grid">
       <el-card shadow="never">
         <template #header><strong>新增涌水记录</strong></template>
         <el-alert v-if="error" :title="error" type="error" :closable="false" style="margin-bottom: 10px" />
+        <fieldset :disabled="!lock.isHolder.value" class="lock-fieldset">
         <el-form :model="form" label-width="120px">
           <el-form-item label="出水部位" required>
             <el-input v-model="form.position" placeholder="如 拱顶右侧 3 m" />
@@ -160,6 +223,7 @@ onMounted(async () => {
             />
           </el-form-item>
         </el-form>
+        </fieldset>
       </el-card>
 
       <div class="right">
@@ -217,7 +281,7 @@ onMounted(async () => {
             <el-table-column prop="changeTrend" label="趋势" width="90" />
             <el-table-column label="操作" width="90">
               <template #default="{ row }">
-                <el-button size="small" danger @click="gradeStore.removeWater(row.id)">删除</el-button>
+                <el-button size="small" danger :disabled="!lock.isHolder.value" @click="removeRow(row.id)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -271,5 +335,10 @@ onMounted(async () => {
 .muted {
   color: #7b8592;
   font-size: 13px;
+}
+.lock-fieldset {
+  border: none;
+  padding: 0;
+  margin: 0;
 }
 </style>

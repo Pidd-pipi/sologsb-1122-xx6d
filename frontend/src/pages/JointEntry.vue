@@ -4,8 +4,10 @@ import { useRoute, useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { useFaceStore } from '../stores/faceStore';
 import { useJointStore } from '../stores/jointStore';
+import { useFaceLock } from '../hooks/useFaceLock';
 import JointPolarPlot from '../components/common/JointPolarPlot.vue';
 import SketchCanvas from '../components/common/SketchCanvas.vue';
+import LockBanner from '../components/common/LockBanner.vue';
 import {
   FILL_MATERIALS,
   ROUGHNESSES,
@@ -46,6 +48,38 @@ const form = reactive<JointSetDraft>({
   jointCount: 5,
 });
 
+const lock = useFaceLock({
+  faceId,
+  scope: 'joint',
+  draftSource: () => ({ ...form }),
+});
+
+function rename(name: string) {
+  lock.relay.setTabName(name);
+}
+
+/** 接续旧草稿回填表单 */
+function restoreDraft() {
+  const payload = lock.draft.value?.payload as Partial<JointSetDraft> | undefined;
+  if (payload) {
+    Object.assign(form, {
+      faceId: faceId.value,
+      setNo: payload.setNo ?? form.setNo,
+      dipDirection: payload.dipDirection ?? form.dipDirection,
+      dipAngle: payload.dipAngle ?? form.dipAngle,
+      spacing: payload.spacing ?? form.spacing,
+      persistence: payload.persistence ?? form.persistence,
+      aperture: payload.aperture ?? form.aperture,
+      fillMaterial: payload.fillMaterial ?? form.fillMaterial,
+      roughness: payload.roughness ?? form.roughness,
+      waterWet: payload.waterWet ?? form.waterWet,
+      jointCount: payload.jointCount ?? form.jointCount,
+    });
+    ElMessage.success('已接续上次未保存的节理草稿');
+  }
+  lock.markDraftRestored();
+}
+
 watch(
   faceId,
   (id) => {
@@ -68,6 +102,10 @@ const apparentDipHint = computed(() => {
 });
 
 async function submit() {
+  if (!lock.isHolder.value) {
+    ElMessage.warning('请先申请并取得本掌子面的编辑权');
+    return;
+  }
   error.value = '';
   if (!form.faceId) {
     error.value = '未指定掌子面';
@@ -82,12 +120,17 @@ async function submit() {
     return;
   }
   const created = await jointStore.add({ ...form });
+  await lock.clearDraft();
   ElMessage.success(`已录入 J${created.setNo}：${attitudeText(created.dipDirection, created.dipAngle)}`);
-  form.setNo = nextSetNo(joints.value.map((j) => j.setNo));
+  form.setNo = nextSetNo(jointStore.byFace(faceId.value).map((j) => j.setNo));
   form.jointCount = 5;
 }
 
 async function mergeCluster(clusterNo: number) {
+  if (!lock.isHolder.value) {
+    ElMessage.warning('合并操作需要编辑权');
+    return;
+  }
   const cluster = clusters.value.find((c) => c.clusterNo === clusterNo);
   if (!cluster || cluster.members.length < 2) {
     ElMessage.warning('该簇只有一个组，无需合并');
@@ -100,9 +143,19 @@ async function mergeCluster(clusterNo: number) {
   ElMessage.success(`已把 ${cluster.members.slice(1).join('、')} 合并入 J${target.setNo}`);
 }
 
+async function removeJoint(id: string) {
+  if (!lock.isHolder.value) {
+    ElMessage.warning('删除操作需要编辑权');
+    return;
+  }
+  await jointStore.remove(id);
+}
+
 onMounted(async () => {
   await faceStore.load();
   await jointStore.load();
+  // 进入即申请编录权；他人占用时自动排队，等待期间离线只读查看
+  await lock.request();
 });
 </script>
 
@@ -116,10 +169,28 @@ onMounted(async () => {
       <el-button @click="router.push(`/grade/${faceId}`)">围岩级别判定</el-button>
     </div>
 
+    <LockBanner
+      :state="lock.state.value"
+      scope="joint"
+      :lease="lock.lease.value"
+      :wait-position="lock.waitPosition.value"
+      :waits="lock.waits.value"
+      :tab-name="lock.relay.tabName"
+      :has-draft="!!lock.draft.value && !lock.draftRestored.value"
+      :draft-owner="lock.draft.value?.ownerName"
+      @request="lock.request"
+      @release="lock.release"
+      @rename="rename"
+      @restore-draft="restoreDraft"
+      @discard-draft="lock.discardDraft"
+    />
+
     <div class="grid">
       <el-card shadow="never">
         <template #header><strong>新增节理组</strong></template>
         <el-alert v-if="error" :title="error" type="error" :closable="false" style="margin-bottom: 10px" />
+        <fieldset :disabled="!lock.isHolder.value" class="lock-fieldset">
+
         <el-form :model="form" label-width="110px">
           <el-form-item label="组号">
             <el-input-number v-model="form.setNo" :min="1" :max="99" />
@@ -164,6 +235,7 @@ onMounted(async () => {
             <el-button type="primary" @click="submit">保存节理组</el-button>
           </el-form-item>
         </el-form>
+        </fieldset>
       </el-card>
 
       <div class="right">
@@ -191,7 +263,7 @@ onMounted(async () => {
             <el-table-column prop="jointCount" label="合计条数" width="100" />
             <el-table-column label="操作" width="110">
               <template #default="{ row }">
-                <el-button size="small" :disabled="row.members.length < 2" @click="mergeCluster(row.clusterNo)">
+                <el-button size="small" :disabled="!lock.isHolder.value || row.members.length < 2" @click="mergeCluster(row.clusterNo)">
                   合并
                 </el-button>
               </template>
@@ -218,7 +290,7 @@ onMounted(async () => {
             <el-table-column prop="jointCount" label="条数" width="80" />
             <el-table-column label="操作" width="90">
               <template #default="{ row }">
-                <el-button size="small" danger @click="jointStore.remove(row.id)">删除</el-button>
+                <el-button size="small" danger :disabled="!lock.isHolder.value" @click="removeJoint(row.id)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -226,7 +298,12 @@ onMounted(async () => {
 
         <el-card v-if="face" shadow="never">
           <template #header><strong>岩性素描（可继续布置结构面）</strong></template>
-          <SketchCanvas :face-id="face.id" :lithology="face.lithology" :attitude="face.attitude" />
+          <SketchCanvas
+            :face-id="face.id"
+            :lithology="face.lithology"
+            :attitude="face.attitude"
+            :readonly="!lock.isHolder.value"
+          />
         </el-card>
       </div>
     </div>
@@ -277,5 +354,10 @@ onMounted(async () => {
   margin-left: 8px;
   color: #d93025;
   font-size: 12px;
+}
+.lock-fieldset {
+  border: none;
+  padding: 0;
+  margin: 0;
 }
 </style>

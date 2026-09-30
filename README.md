@@ -26,7 +26,8 @@ docker compose down
 | 构建 | Vite 5 |
 | 状态管理 | Pinia |
 | 路由 | Vue Router 4（history 模式） |
-| 本地存储 | IndexedDB（Dexie 4）+ localStorage（素描线段），含结构版本号与升级迁移 |
+| 本地存储 | IndexedDB（Dexie 4）+ localStorage（素描线段、接力租约），含结构版本号与升级迁移 |
+| 多标签页协作 | Web Locks API + BroadcastChannel + localStorage 心跳租约（无后端，纯浏览器原语） |
 
 ## 本地开发
 
@@ -58,12 +59,12 @@ sologsb-1122/
         ├── main.ts
         ├── App.vue
         ├── router/index.ts
-        ├── types/{face,joint,grade,water}.ts
-        ├── stores/{face,joint,grade}Store.ts
-        ├── components/common/{SketchCanvas,JointPolarPlot,GradeTag,FaceCard}.vue
-        ├── hooks/{useFaceFilter,useGradeCalc}.ts
+        ├── types/{face,joint,grade,water,relay}.ts
+        ├── stores/{face,joint,grade,relayStore}.ts
+        ├── components/common/{SketchCanvas,JointPolarPlot,GradeTag,FaceCard,LockBanner}.vue
+        ├── hooks/{useFaceFilter,useGradeCalc,useFaceLock}.ts
         ├── pages/{FaceList,FaceDetail,JointEntry,WaterView,GradeJudge}.vue
-        └── utils/{db,geoMath,id}.ts
+        └── utils/{db,geoMath,id,relayBus,gradeBasis,dataSync,timing}.ts
 ```
 
 ## 页面与路由
@@ -80,12 +81,30 @@ sologsb-1122/
 
 ## 数据存储说明
 
-- 数据库名 `gbtunnelface`，当前结构版本 **v2**（`localStorage['gbtunnelface:db-version']` 记录）。
-- 四张表：`faces`（掌子面）、`joints`（节理组）、`grades`（围岩级别判定）、`waters`（涌水记录）。
+- 数据库名 `gbtunnelface`，当前结构版本 **v3**（`localStorage['gbtunnelface:db-version']` 记录）。
+- 五张表：`faces`（掌子面）、`joints`（节理组）、`grades`（围岩级别判定）、`waters`（涌水记录）、`drafts`（编录接力草稿）。
 - v1 → v2 迁移：为老掌子面补 `attitude`、`mileageRange`，为级别记录补 `correctedBq`、`manualAdjusted`，为涌水补 `chainage`，并新增索引。
+- v2 → v3 迁移：新增 `drafts` 草稿表（主键 `faceId:scope`），`grades` 增加接力状态索引；判定记录新增的 `status / basisSignature / reviewRequired / autoGrade` 等字段为可选项，老数据自动按「现行」对待。
 - 岩性素描的结构面线段单独存 `localStorage['gbtunnelface:sketch:<faceId>']`，刷新后仍在。
+- 接力租约存 `localStorage['gbtunnelface:relay:lock:<faceId>]`、排队项存 `localStorage['gbtunnelface:relay:wait:<faceId>:<tabId>]`。
 - 容器无状态、不挂载命名卷；清空站点数据即回到初始示范数据。
 - 首次打开灌入 2 个示范掌子面、4 组节理、1 条级别判定与 3 条涌水记录。
+
+## 编录接力（多标签页同一掌子面）
+
+纯前端、无需后端，全部基于浏览器原语，断网可用：
+
+- **同一时刻一个页面可写**：每张掌子面只有一把编辑权。进入节理/涌水/判定页自动申请；被占用时自动 FIFO 排队，其他页面在横幅与台账卡片上看到占用者（可改名，如地质员姓名）、正在编录的内容与心跳时间，等待期间数据**只读但可离线查看**。
+- **崩溃/无心跳自动释放**：持有者每 2.5s 续租，租约 TTL 9s；页面正常关闭走 `pagehide` 同步释放，崩溃或掉线超过 TTL 由心跳清扫自动释放，队首等待者随即接手。抢占临界区用 Web Locks API 串行化，非安全上下文降级为乐观 CAS。
+- **草稿接力**：编辑中表单每 0.6s 防抖写入 IndexedDB `drafts` 表；原页面崩溃后，接手者进入时可一键「接续草稿」回填，也可丢弃；正式保存后草稿清除。
+- **跨标签页实时一致**：所有写操作经 BroadcastChannel（降级 storage 事件）通知其他标签页重读，台账、详情、判定页与素描图均以接力后的最新数据为准。
+
+## 判定失效与重算
+
+- 每条判定保存时记录**依据签名**（节理产状、涌水、岩层产状等输入的稳定哈希）与依据摘要。
+- **节理、涌水或岩层产状任一变化**，旧现行判定立即标记 `stale`（已失效，不再当现行结论），并在约 0.8s 合并连续录入后按原 RQD/Kv/洞跨等参数自动重算一条新判定；涌水升级会重推地下水修正系数 K1。
+- **自动判定**：以新依据重算的级别直接成为现行结论；**人工修正**：保留人工级别但状态置为「待复核」，同时给出系统自动算得的建议级别与 [BQ]，在判定页可「确认保留 / 采用自动 / 复核改判」，处置后恢复现行。
+- 台账、详情、判定页统一只把 `active / pending` 当现行；`stale / superseded` 记录保留可追溯，列表中灰显划线并标注失效原因。
 
 ## 功能要点
 
