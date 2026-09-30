@@ -1,11 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { useFaceStore } from '../stores/faceStore';
 import { useGradeStore } from '../stores/gradeStore';
 import { useJointStore } from '../stores/jointStore';
+import { useRelayStore } from '../stores/relayStore';
 import { useFaceFilter } from '../hooks/useFaceFilter';
+import { useGradeStaleness } from '../hooks/useGradeStaleness';
+import { onDataChanged } from '../utils/relay';
 import FaceCard from '../components/common/FaceCard.vue';
 import GradeTag from '../components/common/GradeTag.vue';
 import {
@@ -23,7 +26,20 @@ const router = useRouter();
 const faceStore = useFaceStore();
 const gradeStore = useGradeStore();
 const jointStore = useJointStore();
+const relayStore = useRelayStore();
 const { filters, result, options, gradeDistribution, reset } = useFaceFilter();
+const { byFace: stalenessByFace } = useGradeStaleness();
+
+/** 每个掌子面的占用者（其他页面正在编录） */
+const occupantByFace = computed(() => {
+  const map: Record<string, { name: string; stale: boolean }> = {};
+  for (const [faceId, lock] of Object.entries(relayStore.locks)) {
+    if (lock.tabId === relayStore.tabId) continue;
+    const stale = relayStore.isStale(faceId);
+    map[faceId] = { name: lock.operator, stale };
+  }
+  return map;
+});
 
 const dialogVisible = ref(false);
 const error = ref('');
@@ -95,10 +111,21 @@ async function submit() {
 }
 
 onMounted(async () => {
+  relayStore.init();
   await faceStore.load();
   await gradeStore.load();
   await jointStore.load();
 });
+
+// 其他标签页录入后自动刷新台账（接力数据实时可见）
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+const offData = onDataChanged(() => {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    void Promise.all([faceStore.load(), gradeStore.load(), jointStore.load()]);
+  }, 400);
+});
+onUnmounted(offData);
 </script>
 
 <template>
@@ -169,6 +196,10 @@ onMounted(async () => {
         :grade="row.grade"
         :joint-count="jointStore.byFace(row.face.id).length"
         :water-count="gradeStore.watersByFace(row.face.id).length"
+        :occupant="occupantByFace[row.face.id]?.name"
+        :occupant-stale="occupantByFace[row.face.id]?.stale"
+        :grade-stale="stalenessByFace[row.face.id]?.stale"
+        :grade-manual="stalenessByFace[row.face.id]?.manual"
         :footer="`编录时间 ${new Date(row.lastRecordedAt).toLocaleString('zh-CN')}`"
         @open="(id) => router.push(`/faces/${id}`)"
       />

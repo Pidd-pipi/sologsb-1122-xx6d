@@ -107,6 +107,7 @@ export async function ensureSeedData(): Promise<void> {
       rockStrength: 62,
       attitude: { strike: 42, dipDirection: 132, dipAngle: 34 },
       recordedAt: now - 2 * day,
+      updatedAt: now - 2 * day,
       geologist: '岑柏川',
     },
     {
@@ -121,6 +122,7 @@ export async function ensureSeedData(): Promise<void> {
       rockStrength: 18,
       attitude: { strike: 48, dipDirection: 138, dipAngle: 28 },
       recordedAt: now - 6 * hour,
+      updatedAt: now - 6 * hour,
       geologist: '岑柏川',
     },
   ];
@@ -139,6 +141,7 @@ export async function ensureSeedData(): Promise<void> {
       roughness: '粗糙',
       waterWet: '潮湿',
       jointCount: 9,
+      createdAt: now - 2 * day,
     },
     {
       id: newId('joint'),
@@ -153,6 +156,7 @@ export async function ensureSeedData(): Promise<void> {
       roughness: '平整',
       waterWet: '滴水',
       jointCount: 5,
+      createdAt: now - 2 * day,
     },
     {
       id: newId('joint'),
@@ -167,6 +171,7 @@ export async function ensureSeedData(): Promise<void> {
       roughness: '起伏粗糙',
       waterWet: '干燥',
       jointCount: 12,
+      createdAt: now - 2 * day,
     },
     {
       id: newId('joint'),
@@ -181,6 +186,7 @@ export async function ensureSeedData(): Promise<void> {
       roughness: '平直光滑',
       waterWet: '线流',
       jointCount: 4,
+      createdAt: now - 6 * hour,
     },
   ];
 

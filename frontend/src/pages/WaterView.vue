@@ -1,10 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { useFaceStore } from '../stores/faceStore';
 import { useGradeStore } from '../stores/gradeStore';
-import { CHANGE_TRENDS, INFLOW_TYPES, isSurge, type ChangeTrend, type InflowType, type WaterInflow, type WaterInflowDraft } from '../types/water';
+import { useRelayStore } from '../stores/relayStore';
+import { useFaceLock } from '../hooks/useFaceLock';
+import { onDataChanged } from '../utils/relay';
+import { toPlain } from '../utils/db';
+import LockBanner from '../components/common/LockBanner.vue';
+import DraftBanner from '../components/common/DraftBanner.vue';
+import { CHANGE_TRENDS, INFLOW_TYPES, isSurge, type ChangeTrend, type InflowType, type WaterInflowDraft } from '../types/water';
 import { waterMeasure } from '../types/grade';
 import { formatChainage, parseChainage } from '../utils/geoMath';
 
@@ -12,6 +18,7 @@ const route = useRoute();
 const router = useRouter();
 const faceStore = useFaceStore();
 const gradeStore = useGradeStore();
+const relayStore = useRelayStore();
 
 const faceId = computed(() => String(route.params.id ?? ''));
 const face = computed(() => faceStore.byId(faceId.value));
@@ -29,6 +36,43 @@ const form = reactive<WaterInflowDraft>({
   changeTrend: '稳定',
   chainage: 0,
 });
+
+// 编录接力：同一时刻只有一个页面可写，掉线自动释放
+const { status, holder, canWrite, takeover } = useFaceLock(faceId);
+
+// 未提交草稿（崩溃 / 刷新后可接上）
+const draft = computed(() => relayStore.draftOf(faceId.value));
+const draftFromSelf = computed(() => draft.value?.tabId === relayStore.tabId);
+
+function resumeDraft() {
+  const d = draft.value;
+  if (!d || d.kind !== 'water') return;
+  Object.assign(form, d.data as WaterInflowDraft);
+  lastSnapshot = JSON.stringify(form);
+  error.value = '';
+  ElMessage.info('已恢复未提交的涌水记录草稿');
+}
+
+function discardDraft() {
+  relayStore.clearDraft(faceId.value, 'water');
+}
+
+let draftTimer: ReturnType<typeof setTimeout> | undefined;
+let lastSnapshot = JSON.stringify(form);
+watch(
+  form,
+  () => {
+    if (!canWrite()) return;
+    const snapshot = JSON.stringify(form);
+    if (snapshot === lastSnapshot) return;
+    lastSnapshot = snapshot;
+    clearTimeout(draftTimer);
+    draftTimer = setTimeout(() => {
+      relayStore.putDraft(faceId.value, 'water', toPlain(form));
+    }, 800);
+  },
+  { deep: true },
+);
 
 const W = 620;
 const H = 220;
@@ -90,18 +134,34 @@ async function submit() {
     return;
   }
   const created = await gradeStore.addWater({ ...form, position: form.position.trim() });
+  relayStore.clearDraft(faceId.value, 'water');
   ElMessage.success(`已记录 ${created.position}：${created.type} ${created.estimatedFlow} L/min`);
   form.position = '';
+  lastSnapshot = JSON.stringify(form);
 }
 
 onMounted(async () => {
+  relayStore.init();
   await faceStore.load();
   await gradeStore.load();
   if (face.value) {
     form.faceId = face.value.id;
     form.chainage = face.value.chainage;
   }
+  // 接力上线后若有未提交草稿，自动接上
+  const d = relayStore.draftOf(faceId.value);
+  if (d && d.kind === 'water') resumeDraft();
 });
+
+// 其他标签页录入后自动刷新
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+const offData = onDataChanged(() => {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    void Promise.all([faceStore.load(), gradeStore.load()]);
+  }, 400);
+});
+onUnmounted(offData);
 </script>
 
 <template>
@@ -115,11 +175,21 @@ onMounted(async () => {
       <el-button @click="router.push(`/faces/${faceId}/joints`)">节理录入</el-button>
     </div>
 
+    <LockBanner :status="status" :holder="holder()" class="relay-banner" @takeover="takeover" />
+    <DraftBanner
+      v-if="canWrite()"
+      :draft="draft"
+      kind="water"
+      :from-self="draftFromSelf"
+      @resume="resumeDraft"
+      @discard="discardDraft"
+    />
+
     <div class="grid">
       <el-card shadow="never">
         <template #header><strong>新增涌水记录</strong></template>
         <el-alert v-if="error" :title="error" type="error" :closable="false" style="margin-bottom: 10px" />
-        <el-form :model="form" label-width="120px">
+        <el-form :model="form" label-width="120px" :disabled="!canWrite()">
           <el-form-item label="出水部位" required>
             <el-input v-model="form.position" placeholder="如 拱顶右侧 3 m" />
           </el-form-item>
@@ -152,7 +222,7 @@ onMounted(async () => {
           </el-form-item>
         </el-form>
         <el-divider />
-        <el-form label-width="120px">
+        <el-form label-width="120px" :disabled="!canWrite()">
           <el-form-item label="里程文本解析">
             <el-input
               placeholder="输入 K12+480 可解析为米制"
@@ -217,7 +287,7 @@ onMounted(async () => {
             <el-table-column prop="changeTrend" label="趋势" width="90" />
             <el-table-column label="操作" width="90">
               <template #default="{ row }">
-                <el-button size="small" danger @click="gradeStore.removeWater(row.id)">删除</el-button>
+                <el-button size="small" danger :disabled="!canWrite()" @click="gradeStore.removeWater(row.id)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -262,6 +332,9 @@ onMounted(async () => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+.relay-banner {
+  margin-bottom: 4px;
 }
 .hint {
   margin-left: 8px;

@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useFaceStore } from '../stores/faceStore';
 import { useGradeStore } from '../stores/gradeStore';
 import { useJointStore } from '../stores/jointStore';
+import { useRelayStore } from '../stores/relayStore';
 import { useGradeCalc } from '../hooks/useGradeCalc';
+import { useGradeStaleness } from '../hooks/useGradeStaleness';
+import { onDataChanged } from '../utils/relay';
 import SketchCanvas from '../components/common/SketchCanvas.vue';
 import GradeTag from '../components/common/GradeTag.vue';
 import { attitudeText, formatChainage } from '../utils/geoMath';
@@ -15,6 +18,7 @@ const router = useRouter();
 const faceStore = useFaceStore();
 const jointStore = useJointStore();
 const gradeStore = useGradeStore();
+const relayStore = useRelayStore();
 
 const faceId = computed(() => String(route.params.id ?? ''));
 const face = computed(() => faceStore.byId(faceId.value));
@@ -22,6 +26,16 @@ const joints = computed(() => jointStore.byFace(faceId.value));
 const grades = computed(() => gradeStore.byFace(faceId.value));
 const latest = computed(() => grades.value[0]);
 const previousGrade = computed(() => grades.value[1]);
+
+const { byFace: stalenessByFace } = useGradeStaleness();
+const staleness = computed(() => stalenessByFace.value[faceId.value]);
+
+/** 占用者（其他页面正在编录）；掉线则提示可去编辑页接力 */
+const occupant = computed(() => {
+  const lock = relayStore.lockOf(faceId.value);
+  if (!lock || lock.tabId === relayStore.tabId) return null;
+  return { name: lock.operator, stale: relayStore.isStale(faceId.value) };
+});
 
 const { result, patch } = useGradeCalc(() => joints.value);
 const segmentCount = ref(0);
@@ -44,6 +58,7 @@ const gradeCompare = computed(() => {
 });
 
 onMounted(async () => {
+  relayStore.init();
   await faceStore.load();
   await jointStore.load();
   await gradeStore.load();
@@ -51,6 +66,16 @@ onMounted(async () => {
     patch({ rockStrength: face.value.rockStrength, spanWidth: Number(face.value.faceSize.split('×')[0]) || 12 });
   }
 });
+
+// 其他标签页录入后自动刷新详情
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+const offData = onDataChanged(() => {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    void Promise.all([faceStore.load(), jointStore.load(), gradeStore.load()]);
+  }, 400);
+});
+onUnmounted(offData);
 </script>
 
 <template>
@@ -68,6 +93,32 @@ onMounted(async () => {
     </div>
 
     <el-alert v-if="!face" type="warning" :closable="false" show-icon title="未找到该掌子面（可能已被删除）" />
+
+    <el-alert
+      v-if="occupant"
+      :type="occupant.stale ? 'info' : 'warning'"
+      :closable="false"
+      show-icon
+      class="relay-alert"
+      :title="occupant.stale
+        ? `占用者（${occupant.name}）已掉线，编辑权已自动释放，可进入编辑页接力`
+        : `该掌子面正由 ${occupant.name} 编辑，当前为只读模式，可离线查看`"
+    />
+
+    <el-alert
+      v-if="staleness?.stale"
+      :type="staleness.manual ? 'warning' : 'error'"
+      :closable="false"
+      show-icon
+      class="relay-alert"
+      :title="staleness.manual
+        ? `人工修正级别待复核：${staleness.reasons.join('、')}。人工修正结论已保留，请重新判定确认`
+        : `围岩级别结论已失效：${staleness.reasons.join('、')}，自动判定将按最新节理 / 涌水 / 产状重算`"
+    >
+      <div>
+        <el-button size="small" type="primary" @click="router.push(`/grade/${faceId}`)">重新判定级别</el-button>
+      </div>
+    </el-alert>
 
     <div v-if="face" class="grid">
       <div class="left">
@@ -96,10 +147,17 @@ onMounted(async () => {
         <el-card shadow="never">
           <template #header><strong>级别与支护</strong></template>
           <div v-if="latest" class="grade-box">
-            <GradeTag :grade="latest.grade" />
+            <div class="grade-line">
+              <GradeTag :grade="latest.grade" />
+              <el-tag v-if="staleness?.stale" size="small" :type="staleness.manual ? 'warning' : 'danger'" effect="dark">
+                {{ staleness.manual ? '待复核' : '已失效' }}
+              </el-tag>
+              <el-tag size="small" effect="plain">{{ latest.manualAdjusted ? '人工修正' : '自动判定' }}</el-tag>
+            </div>
             <span class="muted">[BQ] = {{ latest.correctedBq }}（BQ {{ latest.bqValue }}，修正 {{ latest.correction }}）</span>
             <p class="support">{{ latest.supportSuggestion || GRADE_SUPPORT[latest.grade] }}</p>
             <p class="muted">{{ gradeCompare }}</p>
+            <el-button size="small" type="primary" @click="router.push(`/grade/${faceId}`)">重新判定级别</el-button>
           </div>
           <div v-else>
             <p class="muted">尚未判定级别，按当前参数实时试算：</p>
@@ -132,13 +190,14 @@ onMounted(async () => {
         <template #header>
           <div class="card-head">
             <strong>岩性素描图</strong>
-            <span class="muted">已布置 {{ segmentCount }} 条结构面线段（自动保存在浏览器本地）</span>
+            <span class="muted">已布置 {{ segmentCount }} 条结构面线段（继续布置请到节理录入页接力）</span>
           </div>
         </template>
         <SketchCanvas
           :face-id="face.id"
           :lithology="face.lithology"
           :attitude="face.attitude"
+          readonly
           @change="onSketchChange"
         />
       </el-card>
@@ -194,5 +253,13 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+.grade-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.relay-alert {
+  margin-bottom: 4px;
 }
 </style>

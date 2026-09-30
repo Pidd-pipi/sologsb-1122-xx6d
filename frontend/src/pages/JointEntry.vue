@@ -1,20 +1,23 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { useFaceStore } from '../stores/faceStore';
 import { useJointStore } from '../stores/jointStore';
+import { useRelayStore } from '../stores/relayStore';
+import { useFaceLock } from '../hooks/useFaceLock';
+import { onDataChanged } from '../utils/relay';
+import { toPlain } from '../utils/db';
 import JointPolarPlot from '../components/common/JointPolarPlot.vue';
 import SketchCanvas from '../components/common/SketchCanvas.vue';
+import LockBanner from '../components/common/LockBanner.vue';
+import DraftBanner from '../components/common/DraftBanner.vue';
 import {
   FILL_MATERIALS,
   ROUGHNESSES,
   WATER_WETS,
   isDipAbnormal,
-  type FillMaterial,
   type JointSetDraft,
-  type Roughness,
-  type WaterWet,
 } from '../types/joint';
 import { attitudeText, clusterJoints } from '../utils/geoMath';
 import { nextSetNo } from '../utils/id';
@@ -23,6 +26,7 @@ const route = useRoute();
 const router = useRouter();
 const faceStore = useFaceStore();
 const jointStore = useJointStore();
+const relayStore = useRelayStore();
 
 const faceId = computed(() => String(route.params.id ?? ''));
 const face = computed(() => faceStore.byId(faceId.value));
@@ -45,6 +49,45 @@ const form = reactive<JointSetDraft>({
   waterWet: '潮湿',
   jointCount: 5,
 });
+
+// 编录接力：同一时刻只有一个页面可写，掉线自动释放
+const { status, holder, canWrite, takeover } = useFaceLock(faceId);
+
+// 未提交草稿（崩溃 / 刷新后可接上）
+const draft = computed(() => relayStore.draftOf(faceId.value));
+const draftFromSelf = computed(() => draft.value?.tabId === relayStore.tabId);
+
+function resumeDraft() {
+  const d = draft.value;
+  if (!d || d.kind !== 'joint') return;
+  Object.assign(form, d.data as JointSetDraft);
+  lastSnapshot = JSON.stringify(form);
+  error.value = '';
+  ElMessage.info('已恢复未提交的节理产状草稿');
+}
+
+function discardDraft() {
+  relayStore.clearDraft(faceId.value, 'joint');
+}
+
+// 编辑中自动暂存草稿（防抖）；仅当内容相对上次有变化才写入，
+// 避免表单初始化 / 提交后的空表单被当成草稿
+let draftTimer: ReturnType<typeof setTimeout> | undefined;
+let lastSnapshot = JSON.stringify(form);
+watch(
+  form,
+  () => {
+    if (!canWrite()) return;
+    const snapshot = JSON.stringify(form);
+    if (snapshot === lastSnapshot) return;
+    lastSnapshot = snapshot;
+    clearTimeout(draftTimer);
+    draftTimer = setTimeout(() => {
+      relayStore.putDraft(faceId.value, 'joint', toPlain(form));
+    }, 800);
+  },
+  { deep: true },
+);
 
 watch(
   faceId,
@@ -82,9 +125,11 @@ async function submit() {
     return;
   }
   const created = await jointStore.add({ ...form });
+  relayStore.clearDraft(faceId.value, 'joint');
   ElMessage.success(`已录入 J${created.setNo}：${attitudeText(created.dipDirection, created.dipAngle)}`);
   form.setNo = nextSetNo(joints.value.map((j) => j.setNo));
   form.jointCount = 5;
+  lastSnapshot = JSON.stringify(form);
 }
 
 async function mergeCluster(clusterNo: number) {
@@ -101,9 +146,23 @@ async function mergeCluster(clusterNo: number) {
 }
 
 onMounted(async () => {
+  relayStore.init();
   await faceStore.load();
   await jointStore.load();
+  // 接力上线后若有未提交草稿，自动接上
+  const d = relayStore.draftOf(faceId.value);
+  if (d && d.kind === 'joint') resumeDraft();
 });
+
+// 其他标签页录入后自动刷新
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+const offData = onDataChanged(() => {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    void Promise.all([faceStore.load(), jointStore.load()]);
+  }, 400);
+});
+onUnmounted(offData);
 </script>
 
 <template>
@@ -116,11 +175,21 @@ onMounted(async () => {
       <el-button @click="router.push(`/grade/${faceId}`)">围岩级别判定</el-button>
     </div>
 
+    <LockBanner :status="status" :holder="holder()" class="relay-banner" @takeover="takeover" />
+    <DraftBanner
+      v-if="canWrite()"
+      :draft="draft"
+      kind="joint"
+      :from-self="draftFromSelf"
+      @resume="resumeDraft"
+      @discard="discardDraft"
+    />
+
     <div class="grid">
       <el-card shadow="never">
         <template #header><strong>新增节理组</strong></template>
         <el-alert v-if="error" :title="error" type="error" :closable="false" style="margin-bottom: 10px" />
-        <el-form :model="form" label-width="110px">
+        <el-form :model="form" label-width="110px" :disabled="!canWrite()">
           <el-form-item label="组号">
             <el-input-number v-model="form.setNo" :min="1" :max="99" />
             <span class="hint">建议 J{{ nextSetNo(joints.map((j) => j.setNo)) }}</span>
@@ -191,7 +260,7 @@ onMounted(async () => {
             <el-table-column prop="jointCount" label="合计条数" width="100" />
             <el-table-column label="操作" width="110">
               <template #default="{ row }">
-                <el-button size="small" :disabled="row.members.length < 2" @click="mergeCluster(row.clusterNo)">
+                <el-button size="small" :disabled="row.members.length < 2 || !canWrite()" @click="mergeCluster(row.clusterNo)">
                   合并
                 </el-button>
               </template>
@@ -218,7 +287,7 @@ onMounted(async () => {
             <el-table-column prop="jointCount" label="条数" width="80" />
             <el-table-column label="操作" width="90">
               <template #default="{ row }">
-                <el-button size="small" danger @click="jointStore.remove(row.id)">删除</el-button>
+                <el-button size="small" danger :disabled="!canWrite()" @click="jointStore.remove(row.id)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -226,7 +295,12 @@ onMounted(async () => {
 
         <el-card v-if="face" shadow="never">
           <template #header><strong>岩性素描（可继续布置结构面）</strong></template>
-          <SketchCanvas :face-id="face.id" :lithology="face.lithology" :attitude="face.attitude" />
+          <SketchCanvas
+            :face-id="face.id"
+            :lithology="face.lithology"
+            :attitude="face.attitude"
+            :readonly="!canWrite()"
+          />
         </el-card>
       </div>
     </div>
@@ -267,6 +341,9 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+.relay-banner {
+  margin-bottom: 4px;
 }
 .hint {
   margin-left: 8px;

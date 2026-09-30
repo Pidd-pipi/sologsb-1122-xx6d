@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { db, toPlain } from '../utils/db';
 import { newId } from '../utils/id';
+import { notifyDataChanged } from '../utils/relay';
 import type { RockMassGrade, RockMassGradeDraft } from '../types/grade';
 import type { WaterInflow, WaterInflowDraft } from '../types/water';
 
@@ -32,17 +33,21 @@ export const useGradeStore = defineStore('grade', {
       const record: RockMassGrade = { ...toPlain(draft), id: newId('grade'), judgedAt: Date.now() };
       await db.grades.put(toPlain(record));
       this.items = [record, ...this.items];
+      notifyDataChanged(record.faceId, 'grade');
       return record;
     },
     async addWater(draft: WaterInflowDraft) {
       const record: WaterInflow = { ...toPlain(draft), id: newId('water'), measuredAt: Date.now() };
       await db.waters.put(toPlain(record));
       this.waters = [...this.waters, record].sort((a, b) => a.chainage - b.chainage);
+      notifyDataChanged(record.faceId, 'water');
       return record;
     },
     async removeWater(id: string) {
+      const target = this.waters.find((it) => it.id === id);
       await db.waters.delete(id);
       this.waters = this.waters.filter((it) => it.id !== id);
+      if (target) notifyDataChanged(target.faceId, 'water');
     },
   },
 });

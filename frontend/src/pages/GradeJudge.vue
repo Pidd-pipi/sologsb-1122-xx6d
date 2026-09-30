@@ -1,12 +1,17 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { useFaceStore } from '../stores/faceStore';
 import { useGradeStore } from '../stores/gradeStore';
 import { useJointStore } from '../stores/jointStore';
+import { useRelayStore } from '../stores/relayStore';
 import { useGradeCalc } from '../hooks/useGradeCalc';
+import { useFaceLock } from '../hooks/useFaceLock';
+import { useGradeStaleness } from '../hooks/useGradeStaleness';
+import { onDataChanged } from '../utils/relay';
 import GradeTag from '../components/common/GradeTag.vue';
+import LockBanner from '../components/common/LockBanner.vue';
 import { GROUNDWATERS, GRADE_SUPPORT, ROCK_GRADES, type Groundwater, type RockGrade } from '../types/grade';
 import { attitudeText, estimateJv, formatChainage } from '../utils/geoMath';
 
@@ -15,6 +20,7 @@ const router = useRouter();
 const faceStore = useFaceStore();
 const gradeStore = useGradeStore();
 const jointStore = useJointStore();
+const relayStore = useRelayStore();
 
 const faceId = computed(() => String(route.params.faceId ?? ''));
 const face = computed(() => faceStore.byId(faceId.value));
@@ -25,6 +31,11 @@ const previous = computed(() => history.value[0]);
 const { input, result, patch } = useGradeCalc(() => joints.value);
 const manual = ref(false);
 const manualGrade = ref<RockGrade>('Ⅲ');
+
+// 编录接力：保存判定同样需要编辑权
+const { status, holder, canWrite, takeover } = useFaceLock(faceId);
+const { byFace: stalenessByFace } = useGradeStaleness();
+const staleness = computed(() => stalenessByFace.value[faceId.value]);
 
 const finalGrade = computed<RockGrade>(() => (manual.value ? manualGrade.value : result.value.grade));
 const finalSupport = computed(() => GRADE_SUPPORT[finalGrade.value]);
@@ -52,6 +63,10 @@ async function save() {
     ElMessage.error('未找到该掌子面');
     return;
   }
+  if (!canWrite()) {
+    ElMessage.warning('当前为只读模式，请先接力编辑权');
+    return;
+  }
   await gradeStore.addGrade({
     faceId: face.value.id,
     grade: finalGrade.value,
@@ -70,6 +85,7 @@ async function save() {
 }
 
 onMounted(async () => {
+  relayStore.init();
   await faceStore.load();
   await jointStore.load();
   await gradeStore.load();
@@ -80,6 +96,16 @@ onMounted(async () => {
     });
   }
 });
+
+// 其他标签页录入后自动刷新（节理/涌水/产状变化会触发失效提示）
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+const offData = onDataChanged(() => {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    void Promise.all([faceStore.load(), jointStore.load(), gradeStore.load()]);
+  }, 400);
+});
+onUnmounted(offData);
 </script>
 
 <template>
@@ -95,10 +121,22 @@ onMounted(async () => {
 
     <el-alert v-if="!face" type="warning" :closable="false" show-icon title="未找到该掌子面" />
 
+    <LockBanner :status="status" :holder="holder()" class="relay-banner" @takeover="takeover" />
+
+    <el-alert
+      v-if="staleness?.stale"
+      :type="staleness.manual ? 'warning' : 'error'"
+      :closable="false"
+      show-icon
+      :title="staleness.manual
+        ? `人工修正级别待复核：${staleness.reasons.join('、')}。人工修正结论已保留，请按最新参数重新确认`
+        : `自动围岩级别已失效：${staleness.reasons.join('、')}，下方已按最新节理 / 涌水 / 产状重算，保存后即为现行结论`"
+    />
+
     <div class="grid">
       <el-card shadow="never">
         <template #header><strong>逐项指标输入</strong></template>
-        <el-form label-width="150px">
+        <el-form label-width="150px" :disabled="!canWrite()">
           <el-form-item label="饱和抗压强度 Rc">
             <el-input-number v-model="input.rockStrength" :min="1" :max="300" :step="1" />
             <span class="hint">MPa</span>
@@ -136,16 +174,19 @@ onMounted(async () => {
           <div class="result">
             <GradeTag :grade="finalGrade" />
             <span class="muted">BQ = {{ result.bq }} · [BQ] = {{ result.correctedBq }}</span>
+            <el-tag v-if="staleness?.stale" size="small" :type="staleness.manual ? 'warning' : 'danger'" effect="dark">
+              {{ staleness.manual ? '待复核' : '已失效' }}
+            </el-tag>
             <el-tag v-if="manual" type="warning" size="small">人工修正</el-tag>
           </div>
           <p class="support">{{ finalSupport }}</p>
-          <el-checkbox v-model="manual">启用人工修正级别</el-checkbox>
-          <el-radio-group v-if="manual" v-model="manualGrade" style="margin-top: 8px">
+          <el-checkbox v-model="manual" :disabled="!canWrite()">启用人工修正级别</el-checkbox>
+          <el-radio-group v-if="manual" v-model="manualGrade" style="margin-top: 8px" :disabled="!canWrite()">
             <el-radio-button v-for="g in ROCK_GRADES" :key="g" :value="g">{{ g }}</el-radio-button>
           </el-radio-group>
           <el-divider />
           <p class="muted">{{ compareText }}</p>
-          <el-button type="primary" @click="save">保存判定结果</el-button>
+          <el-button type="primary" :disabled="!canWrite()" @click="save">保存判定结果</el-button>
         </el-card>
 
         <el-card shadow="never">
@@ -163,6 +204,15 @@ onMounted(async () => {
             </el-table-column>
             <el-table-column label="级别" width="90">
               <template #default="{ row }"><GradeTag :grade="row.grade" /></template>
+            </el-table-column>
+            <el-table-column label="状态" width="90">
+              <template #default="{ $index }">
+                <el-tag v-if="$index === 0 && staleness?.stale" size="small" :type="staleness.manual ? 'warning' : 'danger'" effect="dark">
+                  {{ staleness.manual ? '待复核' : '已失效' }}
+                </el-tag>
+                <el-tag v-else-if="$index === 0" size="small" type="success" effect="plain">现行</el-tag>
+                <span v-else class="muted">历史</span>
+              </template>
             </el-table-column>
             <el-table-column prop="bqValue" label="BQ" width="90" />
             <el-table-column prop="correctedBq" label="[BQ]" width="90" />
@@ -249,5 +299,8 @@ onMounted(async () => {
   color: #5b6470;
   font-size: 13px;
   line-height: 1.9;
+}
+.relay-banner {
+  margin-bottom: 4px;
 }
 </style>

@@ -1,7 +1,7 @@
 <script setup lang="ts">
+import GradeTag from './GradeTag.vue';
 import type { TunnelFace } from '../../types/face';
 import type { RockGrade } from '../../types/grade';
-import GradeTag from './GradeTag.vue';
 import { formatChainage } from '../../utils/geoMath';
 
 defineProps<{
@@ -10,6 +10,14 @@ defineProps<{
   jointCount?: number;
   waterCount?: number;
   footer?: string;
+  /** 占用者名称（其他页面正在编录） */
+  occupant?: string;
+  /** 占用者已掉线 */
+  occupantStale?: boolean;
+  /** 现行级别已失效（输入变更后未重算） */
+  gradeStale?: boolean;
+  /** 现行级别为人工修正（失效后标待复核） */
+  gradeManual?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -22,6 +30,12 @@ const emit = defineEmits<{
     <div class="row">
       <strong>{{ face.faceNo }}</strong>
       <GradeTag :grade="grade" />
+      <el-tag v-if="gradeStale" size="small" :type="gradeManual ? 'warning' : 'danger'" effect="dark">
+        {{ gradeManual ? '级别待复核' : '级别已失效' }}
+      </el-tag>
+      <el-tag v-if="occupant" size="small" type="warning" effect="plain">
+        {{ occupantStale ? '占用者掉线' : `编录中 · ${occupant}` }}
+      </el-tag>
       <el-tag size="small" effect="plain">{{ face.excavationMethod }}</el-tag>
     </div>
     <div class="line">

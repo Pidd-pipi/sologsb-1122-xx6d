@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { db, toPlain } from '../utils/db';
 import { newId } from '../utils/id';
+import { notifyDataChanged } from '../utils/relay';
 import type { TunnelFace, TunnelFaceDraft } from '../types/face';
 
 interface FaceState {
@@ -23,15 +24,18 @@ export const useFaceStore = defineStore('face', {
       this.loaded = true;
     },
     async add(draft: TunnelFaceDraft) {
-      const record: TunnelFace = { ...toPlain(draft), id: newId('face'), recordedAt: Date.now() };
+      const now = Date.now();
+      const record: TunnelFace = { ...toPlain(draft), id: newId('face'), recordedAt: now, updatedAt: now };
       await db.faces.put(toPlain(record));
       this.items = [...this.items, record].sort((a, b) => b.chainage - a.chainage);
+      notifyDataChanged(record.id, 'face');
       return record;
     },
     async update(id: string, patch: Partial<TunnelFace>) {
       const plain = toPlain(patch);
       await db.faces.update(id, plain);
       this.items = this.items.map((it) => (it.id === id ? { ...it, ...plain } : it));
+      notifyDataChanged(id, 'face');
     },
     async remove(id: string) {
       await db.faces.delete(id);

@@ -34,9 +34,11 @@ export interface JointSet {
   waterWet: WaterWet;
   /** 条数 */
   jointCount: number;
+  /** 录入时间（用于级别判定失效判定） */
+  createdAt: number;
 }
 
-export type JointSetDraft = Omit<JointSet, 'id'>;
+export type JointSetDraft = Omit<JointSet, 'id' | 'createdAt'>;
 
 /** 倾角是否异常（超出 0~90°） */
 export function isDipAbnormal(dipAngle: number): boolean {
